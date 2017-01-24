@@ -18,6 +18,11 @@ Usage
     -P  --port  DB port
 """
 import sys
+import logbook
+import lxml
+from logbook import StreamHandler
+
+logger = logbook.Logger('xsd2pgsql')
 
 """ You can set default DB connection settings here if you'd like
 """
@@ -29,7 +34,7 @@ DB = {
 }
 
 """ Some configuration items """
-MAX_RECURSE_LEVEL = 10
+MAX_RECURSE_LEVEL = 100
 
 """ XSD to Postgres data type translation dictionary. 
 """
@@ -128,7 +133,8 @@ def pg_normalize(string):
 """
 
 
-def look4element(ns, el, parent=None, recurse_level=0, fail=False, normalize=True):
+def look4element(root, ns, el, parent=None, recurse_level=0, fail=False, normalize=True):
+    nsd = {'r': 'http://www.w3.org/2001/XMLSchema'}
     if recurse_level > MAX_RECURSE_LEVEL: raise MaxRecursion()
     cols = None
     children = False
@@ -136,7 +142,8 @@ def look4element(ns, el, parent=None, recurse_level=0, fail=False, normalize=Tru
     for x in el.findall(ns + 'element'):
         children = True
 
-        rez = look4element(ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
+        rez = look4element(root, ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
+        logger.debug("name: {}, rez: {}", x.get('name'), rez)
         sql += rez[1] + '\n'
         if not rez[0]:
 
@@ -146,8 +153,12 @@ def look4element(ns, el, parent=None, recurse_level=0, fail=False, normalize=Tru
             k = thisType.replace(XMLS_PREFIX, '')
 
             pgType = DEFX2P.get(k) or USER_TYPES.get(k) or None
-            if not pgType and fail:
-                raise InvalidXMLType("%s is an invalid XSD type." % (XMLS_PREFIX + thisType))
+            if not pgType:
+                name = k.replace('dlican:', '')
+                type_node = root.find("r:complexType[@name='{}']".format(name), nsd)
+                if type_node:
+                    rez = look4element(root, ns, type_node, type_node.get('name'), recurse_level + 1, fail=fail)
+                    sql += rez[1] + '\n'
             elif pgType:
                 colName = x.get('name') or x.get('ref')
                 if normalize:
@@ -157,17 +168,17 @@ def look4element(ns, el, parent=None, recurse_level=0, fail=False, normalize=Tru
                     cols = "%s %s" % (colName, pgType)
                 else:
                     cols += ", %s %s" % (colName, pgType)
-            cols += ''
+            # cols += ''
 
     if cols:
         sql += """CREATE TABLE %s (%s);""" % (parent, cols)
     for x in el.findall(ns + 'complexType'):
         children = True
-        rez = look4element(ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
+        rez = look4element(root, ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
         sql += rez[1] + '\n'
     for x in el.findall(ns + 'sequence'):
         children = True
-        rez = look4element(ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
+        rez = look4element(root, ns, x, x.get('name') or parent, recurse_level + 1, fail=fail)
         sql += rez[1] + '\n'
     return (children, sql)
 
@@ -176,19 +187,27 @@ def look4element(ns, el, parent=None, recurse_level=0, fail=False, normalize=Tru
 
 
 def buildTypes(ns, root_element):
-    for el in root_element.findall(ns + 'element'):
+    """
+    To get all the simple element and simpletype that are readily translated into psql native type
+    :param ns:
+    :param root_element:
+    :return:
+    """
+    logger.debug("ns = {}", ns)
+    nsd = {'r': ns}
+    for el in root_element.findall('r:element', nsd):
+        logger.debug('all element: name: {}', el.get('name'))
         if el.get('name') and el.get('type'):
             USER_TYPES[pg_normalize(el.get('name'))] = DEFX2P.get(el.get('type').replace(XMLS_PREFIX, ''))
+            logger.debug("element: name={}, type={}", pg_normalize(el.get('name')), USER_TYPES[pg_normalize(el.get('name'))])
 
-    for el in root_element.findall(ns + 'simpleType'):
-        restr = el.find(ns + 'restriction')
+    for el in root_element.findall('r:simpleType', nsd):
+        restr = el.find('r:restriction', nsd)
         USER_TYPES[pg_normalize(el.get('name'))] = restr.get('base').replace(XMLS_PREFIX, '')
+        logger.debug("simpleType: name={}, type={}", pg_normalize(el.get('name')), USER_TYPES[pg_normalize(el.get('name'))])
 
 
-""" Do it
-"""
-if __name__ == '__main__':
-
+def main():
     """ Imports
     """
     import argparse, psycopg2
@@ -204,8 +223,7 @@ if __name__ == '__main__':
         metavar='FILE',
         type=lambda x: open(x, 'r'),
         nargs='+',
-        help='XSD file to base the Postgres Schema on'
-
+        help='XSD file to base the Postgres Schema on',
     )
     parser.add_argument(
         '-f', '--fail',
@@ -276,14 +294,15 @@ if __name__ == '__main__':
             xsd = etree.parse(f)
 
             # glean out defined tyeps
-            buildTypes(XMLS, xsd)
+            buildTypes("http://www.w3.org/2001/XMLSchema", xsd)
+            # buildTypes("https://services.bloomberg.com/datalic/cans/20121022/cans.xsd", xsd)
 
             # parse structure
             if args.as_is:
                 norm = False
             else:
                 norm = True
-            result = look4element(XMLS, xsd, pg_normalize(f.name.split('.')[0]), fail=args.failOnBadType,
+            result = look4element(xsd, XMLS, xsd, pg_normalize(f.name.split('.')[0]), fail=args.failOnBadType,
                                   normalize=norm)
         if result[1] and not args.db_name:
             print(result[1].replace('\n\n', ''))
@@ -299,3 +318,12 @@ if __name__ == '__main__':
             conn.close()
         else:
             raise Exception("This shouldn't happen.")
+
+
+""" Do it
+"""
+if __name__ == '__main__':
+    st_h = StreamHandler(sys.stdout, level=logbook.DEBUG)
+    with st_h.applicationbound():
+        logger.info("Start ...")
+        main()
